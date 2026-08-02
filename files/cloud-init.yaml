@@ -1,0 +1,329 @@
+#cloud-config
+# Container-Optimized OS. Rootfs is read-only and /home is noexec, so all
+# persistent state lives on the attached data disk mounted at /mnt/disks/data.
+
+write_files:
+  # ---------------------------------------------------------------------------
+  # One-time formatting of the data disk. mkfs runs ONLY if the disk has no
+  # filesystem, so re-running this on an existing vault is a no-op.
+  # ---------------------------------------------------------------------------
+  - path: /etc/vaultwarden/init-disk.sh
+    permissions: "0755"
+    owner: root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      DEVICE="/dev/disk/by-id/google-vaultwarden-data"
+      MOUNT="/mnt/disks/data"
+
+      mkdir -p "$MOUNT"
+
+      if ! blkid "$DEVICE" >/dev/null 2>&1; then
+        echo "No filesystem on $DEVICE; creating ext4."
+        mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard "$DEVICE"
+      else
+        echo "Filesystem already present on $DEVICE; leaving it alone."
+      fi
+
+      # discard keeps the disk thin; noatime avoids needless writes for SQLite.
+      mount -o discard,defaults,noatime "$DEVICE" "$MOUNT"
+
+      mkdir -p "$MOUNT/vaultwarden" "$MOUNT/caddy/data" "$MOUNT/caddy/config"
+      # Vaultwarden's alpine image runs as root by default; keep 0700 so the
+      # SQLite DB and rsa_key.pem are not world-readable.
+      chmod 0700 "$MOUNT/vaultwarden"
+
+      # 1GB of RAM with no swap is tight; icon fetches can spike. A small
+      # swapfile is cheap insurance against the OOM killer taking Vaultwarden.
+      if [ ! -f "$MOUNT/swapfile" ]; then
+        fallocate -l 1G "$MOUNT/swapfile"
+        chmod 600 "$MOUNT/swapfile"
+        mkswap "$MOUNT/swapfile"
+      fi
+      swapon "$MOUNT/swapfile" || true
+
+  - path: /etc/vaultwarden/Caddyfile
+    permissions: "0644"
+    owner: root
+    content: |
+      {
+        email ${acme_email}
+      }
+
+      ${domain} {
+        encode gzip
+
+        # Vaultwarden serves the API, web vault and the WebSocket
+        # notifications endpoint all from the same port.
+        reverse_proxy vaultwarden:8080 {
+          header_up X-Real-IP {remote_host}
+        }
+
+        header {
+          Strict-Transport-Security "max-age=31536000; includeSubDomains"
+          X-Frame-Options "SAMEORIGIN"
+          X-Content-Type-Options "nosniff"
+          Referrer-Policy "same-origin"
+          -Server
+        }
+
+        log {
+          output stderr
+          format console
+        }
+      }
+
+  # ---------------------------------------------------------------------------
+  # Fetch the admin token from Secret Manager at boot rather than baking it into
+  # instance metadata, where anyone with compute.instances.get could read it.
+  # ---------------------------------------------------------------------------
+  - path: /etc/vaultwarden/fetch-secrets.sh
+    permissions: "0755"
+    owner: root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      ENV_FILE="/mnt/disks/data/vaultwarden/admin.env"
+      : > "$ENV_FILE"
+      chmod 0600 "$ENV_FILE"
+
+      if [ "${enable_admin_page}" != "true" ]; then
+        echo "Admin page disabled."
+        exit 0
+      fi
+
+      TOKEN_URL="https://secretmanager.googleapis.com/v1/projects/${project_id}/secrets/${admin_secret_id}/versions/latest:access"
+
+      # Parse with python3 (present on COS) rather than sed: the Secret Manager
+      # response is pretty-printed multi-line JSON, which a line-oriented sed
+      # pattern cannot match reliably.
+      ACCESS_TOKEN="$(curl -s -H 'Metadata-Flavor: Google' \
+        'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' 2>/dev/null || true)"
+
+      if [ -z "$ACCESS_TOKEN" ]; then
+        echo "WARNING: no metadata access token; admin page will be disabled." >&2
+        exit 0
+      fi
+
+      PAYLOAD="$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" "$TOKEN_URL" \
+        | python3 -c 'import json,sys,base64; print(base64.b64decode(json.load(sys.stdin)["payload"]["data"]).decode())' 2>/dev/null || true)"
+
+      if [ -z "$PAYLOAD" ]; then
+        echo "WARNING: could not read admin token; admin page will be disabled." >&2
+        exit 0
+      fi
+
+      # Written as a docker env-file. The value may contain '$' (Argon2 PHC),
+      # so it must never be passed through shell interpolation.
+      printf 'ADMIN_TOKEN=%s\n' "$PAYLOAD" > "$ENV_FILE"
+
+  # ---------------------------------------------------------------------------
+  # Runtime settings are read from instance metadata on every service start,
+  # NOT baked into the unit file. cloud-init runs only on first boot, so a unit
+  # with values substituted at render time would silently ignore any later
+  # `terraform apply` until the VM was rebuilt.
+  # ---------------------------------------------------------------------------
+  - path: /etc/vaultwarden/fetch-runtime-config.sh
+    permissions: "0755"
+    owner: root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      ENV_FILE="/mnt/disks/data/vaultwarden/runtime.env"
+
+      md() {
+        curl -s -f -H 'Metadata-Flavor: Google' \
+          "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$1" 2>/dev/null || echo "$2"
+      }
+
+      {
+        printf 'DOMAIN=%s\n'          "$(md vw-domain          'https://${domain}')"
+        printf 'SIGNUPS_ALLOWED=%s\n' "$(md vw-signups-allowed '${signups_allowed}')"
+      } > "$ENV_FILE"
+      chmod 0600 "$ENV_FILE"
+      echo "Runtime config: $(tr '\n' ' ' < "$ENV_FILE")"
+
+  # ---------------------------------------------------------------------------
+  # Backup: SIGUSR1 makes Vaultwarden run `VACUUM INTO`, producing a
+  # transactionally consistent SQLite copy. The DB alone is NOT restorable —
+  # rsa_key.pem (JWT signing key), config.json, attachments and sends are
+  # archived alongside it.
+  # ---------------------------------------------------------------------------
+  - path: /etc/vaultwarden/backup.sh
+    permissions: "0755"
+    owner: root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      DATA="/mnt/disks/data/vaultwarden"
+      BUCKET="${backup_bucket}"
+      STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+      WORK="$(mktemp -d)"
+      trap 'rm -rf "$WORK"' EXIT
+
+      # Clear any snapshot left behind by a previous failed run, so the "newest
+      # file" selection below cannot silently pick up a stale database.
+      rm -f "$DATA"/db_*.sqlite3
+
+      # `backup` runs the same VACUUM INTO as the USR1 signal, but synchronously
+      # and with a non-zero exit + message on failure. USR1 is fire-and-forget,
+      # which makes a failed backup look identical to a successful one.
+      /usr/bin/docker exec vaultwarden /vaultwarden backup
+
+      # Newest snapshot; Vaultwarden names them db_<timestamp>.sqlite3.
+      SNAPSHOT="$(find "$DATA" -maxdepth 1 -name 'db_*.sqlite3' -print0 2>/dev/null \
+        | xargs -0 -r ls -1t 2>/dev/null | head -1)"
+      if [ -z "$SNAPSHOT" ]; then
+        echo "ERROR: no snapshot produced; aborting backup." >&2
+        exit 1
+      fi
+
+      cp "$SNAPSHOT" "$WORK/db.sqlite3"
+      # rsa_key.pem is essential: without it every client session is invalidated.
+      for f in rsa_key.pem rsa_key.pub.pem config.json; do
+        [ -f "$DATA/$f" ] && cp "$DATA/$f" "$WORK/" || true
+      done
+      for d in attachments sends; do
+        [ -d "$DATA/$d" ] && cp -r "$DATA/$d" "$WORK/" || true
+      done
+
+      TAR="/tmp/vaultwarden-$STAMP.tar.gz"
+      tar -czf "$TAR" -C "$WORK" .
+
+      # Plain resumable-free PUT to the JSON API rather than `gcloud storage cp`.
+      # gcloud performs a preflight GET, which would require storage.objects.get
+      # and thus read access to every existing backup. A raw upload needs only
+      # storage.objects.create, so a compromised VM can add new backups but can
+      # neither read nor destroy the existing history.
+      ACCESS_TOKEN="$(curl -s -H 'Metadata-Flavor: Google' \
+        'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
+
+      HTTP_CODE="$(curl -s -o /tmp/upload_result.json -w '%%{http_code}' \
+        -X POST \
+        -H "Authorization: Bearer $ACCESS_TOKEN" \
+        -H "Content-Type: application/gzip" \
+        --data-binary "@$TAR" \
+        "https://storage.googleapis.com/upload/storage/v1/b/$BUCKET/o?uploadType=media&name=vaultwarden-$STAMP.tar.gz")"
+
+      if [ "$HTTP_CODE" != "200" ]; then
+        echo "ERROR: upload failed with HTTP $HTTP_CODE" >&2
+        cat /tmp/upload_result.json >&2 || true
+        exit 1
+      fi
+
+      # The snapshot is a full copy of the DB; leaving them around fills the disk.
+      rm -f "$SNAPSHOT" "$TAR"
+      echo "Backup complete: gs://$BUCKET/vaultwarden-$STAMP.tar.gz"
+
+  - path: /etc/systemd/system/vaultwarden.service
+    permissions: "0644"
+    owner: root
+    content: |
+      [Unit]
+      Description=Vaultwarden
+      After=network-online.target vaultwarden-disk.service
+      Requires=vaultwarden-disk.service
+      Wants=network-online.target
+
+      [Service]
+      Restart=always
+      RestartSec=10
+      ExecStartPre=/bin/bash /etc/vaultwarden/fetch-secrets.sh
+      ExecStartPre=/bin/bash /etc/vaultwarden/fetch-runtime-config.sh
+      ExecStartPre=-/usr/bin/docker rm -f vaultwarden
+      ExecStart=/usr/bin/docker run --rm --name vaultwarden \
+        --network vaultwarden-net \
+        --env-file /mnt/disks/data/vaultwarden/admin.env \
+        --env-file /mnt/disks/data/vaultwarden/runtime.env \
+        -e ROCKET_PORT=8080 \
+        -e ROCKET_ADDRESS=0.0.0.0 \
+        -e DATA_FOLDER=/data \
+        -e ENABLE_WEBSOCKET=true \
+        -e LOG_LEVEL=warn \
+        -e IP_HEADER=X-Real-IP \
+        -v /mnt/disks/data/vaultwarden:/data \
+        ${vaultwarden_image}
+      ExecStop=/usr/bin/docker stop --time=30 vaultwarden
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/vaultwarden-disk.service
+    permissions: "0644"
+    owner: root
+    content: |
+      [Unit]
+      Description=Prepare and mount the Vaultwarden data disk
+      After=local-fs.target
+      Before=docker.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=true
+      ExecStart=/bin/bash /etc/vaultwarden/init-disk.sh
+      ExecStartPost=-/usr/bin/docker network create vaultwarden-net
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/caddy.service
+    permissions: "0644"
+    owner: root
+    content: |
+      [Unit]
+      Description=Caddy reverse proxy with automatic HTTPS
+      After=network-online.target vaultwarden.service
+      Requires=vaultwarden-disk.service
+      Wants=network-online.target
+
+      [Service]
+      Restart=always
+      RestartSec=10
+      ExecStartPre=-/usr/bin/docker rm -f caddy
+      ExecStart=/usr/bin/docker run --rm --name caddy \
+        --network vaultwarden-net \
+        -p 80:80 -p 443:443 -p 443:443/udp \
+        -v /etc/vaultwarden/Caddyfile:/etc/caddy/Caddyfile:ro \
+        -v /mnt/disks/data/caddy/data:/data \
+        -v /mnt/disks/data/caddy/config:/config \
+        ${caddy_image}
+      ExecStop=/usr/bin/docker stop --time=15 caddy
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/vaultwarden-backup.service
+    permissions: "0644"
+    owner: root
+    content: |
+      [Unit]
+      Description=Back up Vaultwarden to GCS
+      After=vaultwarden.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/bin/bash /etc/vaultwarden/backup.sh
+
+  - path: /etc/systemd/system/vaultwarden-backup.timer
+    permissions: "0644"
+    owner: root
+    content: |
+      [Unit]
+      Description=Nightly Vaultwarden backup
+
+      [Timer]
+      OnCalendar=${backup_schedule}
+      Persistent=true
+      RandomizedDelaySec=600
+
+      [Install]
+      WantedBy=timers.target
+
+runcmd:
+  - systemctl daemon-reload
+  - systemctl enable --now vaultwarden-disk.service
+  - systemctl enable --now vaultwarden.service
+  - systemctl enable --now caddy.service
+  - systemctl enable --now vaultwarden-backup.timer

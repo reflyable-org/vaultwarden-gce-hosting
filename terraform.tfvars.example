@@ -1,0 +1,46 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+
+# --- Required -----------------------------------------------------------------
+project_id = "PLACEHOLDER-vaultwarden"
+domain     = "vault.PLACEHOLDER.com"
+acme_email = "PLACEHOLDER@example.com"
+
+# --- Project creation ---------------------------------------------------------
+# Leave false if you created the project by hand (billing must be enabled).
+# Set true, plus billing_account and one of org_id/folder_id, to have Terraform
+# create it. Personal gmail accounts usually have no org — create the project
+# manually in that case.
+create_project  = false
+billing_account = "XXXXXX-XXXXXX-XXXXXX"
+# org_id        = "000000000000"
+# folder_id     = "000000000000"
+
+# --- Free tier ----------------------------------------------------------------
+# Only us-west1 / us-central1 / us-east1 are free for e2-micro.
+region = "us-central1"
+zone   = "us-central1-a"
+
+# boot + data must total <= 30GB.
+boot_disk_gb = 20
+data_disk_gb = 10
+
+# --- Vaultwarden --------------------------------------------------------------
+# Set true ONLY long enough to register your account, then set false and
+# re-apply. An internet-facing server with signups open lets anyone register.
+signups_allowed = false
+
+enable_admin_page = true
+
+# Argon2 PHC string. Generate with:
+#   docker run --rm -it docker.io/vaultwarden/server:1.37.1-alpine /vaultwarden hash
+# Wrap in single quotes — it contains '$'.
+# admin_token_hash = '$argon2id$v=19$m=65540,t=3,p=4$...'
+
+# --- Backups & budget ---------------------------------------------------------
+backup_retention_days = 30
+backup_schedule       = "02:30"
+
+enable_budget_alert = true
+# Denominated in your billing account's currency, read automatically.
+budget_amount       = 1
+budget_alert_emails = ["PLACEHOLDER@example.com"]

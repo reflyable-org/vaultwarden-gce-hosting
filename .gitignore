@@ -1,0 +1,21 @@
+# Terraform state contains secrets in plaintext (admin token). Never commit.
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+crash.*.log
+
+# Real variable values.
+terraform.tfvars
+*.auto.tfvars
+!terraform.tfvars.example
+
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+.DS_Store
+
+# Leftovers from the removed Rust checkout
+target/
