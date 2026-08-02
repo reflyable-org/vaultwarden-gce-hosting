@@ -57,6 +57,12 @@ resource "google_compute_instance" "vault" {
   # Required so Terraform can change machine type / metadata in place.
   allow_stopping_for_update = true
 
+  # WireGuard NATs tunnel traffic out through this NIC. Without this, GCP's
+  # network drops any packet whose source address is not the instance's own —
+  # which is every packet arriving from a VPN peer. Changing it replaces the
+  # instance; the data disk is unaffected (prevent_destroy + ignore_changes).
+  can_ip_forward = true
+
   boot_disk {
     initialize_params {
       image = data.google_compute_image.cos.self_link
@@ -97,6 +103,12 @@ resource "google_compute_instance" "vault" {
     # first boot, so values baked into the unit file would otherwise be stale.
     vw-domain          = "https://${var.domain}"
     vw-signups-allowed = var.signups_allowed ? "true" : "false"
+
+    # Same two-tier pattern for WireGuard: read by wg-runtime-config.sh on every
+    # start, so the port or tunnel subnet can change with
+    # `terraform apply` + `systemctl restart wireguard`, no rebuild.
+    wg-port   = tostring(var.wireguard_port)
+    wg-subnet = var.wireguard_subnet
 
     # Block project-wide SSH keys; access is via IAP + OS Login only.
     enable-oslogin         = "TRUE"

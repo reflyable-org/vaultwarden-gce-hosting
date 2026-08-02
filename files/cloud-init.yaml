@@ -29,9 +29,12 @@ write_files:
       mount -o discard,defaults,noatime "$DEVICE" "$MOUNT"
 
       mkdir -p "$MOUNT/vaultwarden" "$MOUNT/caddy/data" "$MOUNT/caddy/config"
+      mkdir -p "$MOUNT/wireguard/peers"
       # Vaultwarden's alpine image runs as root by default; keep 0700 so the
       # SQLite DB and rsa_key.pem are not world-readable.
       chmod 0700 "$MOUNT/vaultwarden"
+      # Private keys for the VPN server and every peer live here.
+      chmod 0700 "$MOUNT/wireguard" "$MOUNT/wireguard/peers"
 
       # 1GB of RAM with no swap is tight; icon fetches can spike. A small
       # swapfile is cheap insurance against the OOM killer taking Vaultwarden.
@@ -143,6 +146,326 @@ write_files:
       } > "$ENV_FILE"
       chmod 0600 "$ENV_FILE"
       echo "Runtime config: $(tr '\n' ' ' < "$ENV_FILE")"
+
+  # ---------------------------------------------------------------------------
+  # WireGuard runtime settings, same two-tier pattern as fetch-runtime-config.sh:
+  # read from metadata on every start so the port and tunnel subnet can change
+  # without rebuilding the VM.
+  # ---------------------------------------------------------------------------
+  - path: /etc/vaultwarden/wg-runtime-config.sh
+    permissions: "0755"
+    owner: root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      ENV_FILE="/mnt/disks/data/wireguard/runtime.env"
+      mkdir -p /mnt/disks/data/wireguard/peers
+      chmod 0700 /mnt/disks/data/wireguard /mnt/disks/data/wireguard/peers
+
+      md() {
+        curl -s -f -H 'Metadata-Flavor: Google' \
+          "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$1" 2>/dev/null || echo "$2"
+      }
+
+      {
+        printf 'WG_PORT=%s\n'     "$(md wg-port   '${wireguard_port}')"
+        printf 'WG_SUBNET=%s\n'   "$(md wg-subnet '${wireguard_subnet}')"
+        printf 'WG_ENDPOINT=%s\n' '${wireguard_endpoint}'
+      } > "$ENV_FILE"
+      chmod 0600 "$ENV_FILE"
+      echo "WireGuard runtime config: $(tr '\n' ' ' < "$ENV_FILE")"
+
+  # ---------------------------------------------------------------------------
+  # Generates the server keypair once, then rebuilds wg0.conf from the per-peer
+  # files in peers/ on every start. Treating peers/ as the source of truth means
+  # adding or revoking a device is a file plus a restart, and a reboot can never
+  # regenerate keys that clients already trust.
+  # ---------------------------------------------------------------------------
+  - path: /etc/vaultwarden/wg-init.sh
+    permissions: "0755"
+    owner: root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      WG="/mnt/disks/data/wireguard"
+      # shellcheck disable=SC1091
+      . "$WG/runtime.env"
+
+      # Forwarding is what makes this an exit node rather than a private overlay.
+      # Deliberately NOT net.ipv4.conf.all.src_valid_mark: on COS that setting
+      # propagates to eth0 and drops every established SSH and HTTPS connection
+      # the moment it is applied, leaving the VM unreachable until a reset. It is
+      # only needed for wg-quick's fwmark-based default route, which this setup
+      # does not use — the tunnel is a plain interface plus explicit NAT.
+      sysctl -qw net.ipv4.ip_forward=1
+
+      # COS ships the in-tree WireGuard module, so the datapath is the kernel's.
+      modprobe wireguard
+
+      # Only the `wg` userspace tool comes from the container: it is musl-linked
+      # and cannot run on COS directly, and COS has no package manager. The
+      # container is transient and shares the host netns just long enough to
+      # configure wg0 — it is NOT a long-running --network host service, which is
+      # what previously took the VM's networking down at every restart.
+      wg_run() {
+        /usr/bin/docker run --rm -i --network host --cap-add NET_ADMIN \
+          -v "$WG:/wg" --entrypoint "" ${wireguard_image} "$@"
+      }
+
+      if [ ! -f "$WG/server_private.key" ]; then
+        echo "Generating WireGuard server keypair."
+        umask 077
+        wg_run wg genkey > "$WG/server_private.key"
+        chmod 0600 "$WG/server_private.key"
+        wg_run wg pubkey < "$WG/server_private.key" > "$WG/server_public.key"
+        chmod 0644 "$WG/server_public.key"
+      fi
+
+      # First host address in the tunnel range, e.g. 10.8.0.1 for 10.8.0.0/24.
+      SERVER_IP="$(python3 -c "import ipaddress,sys; print(str(ipaddress.ip_network(sys.argv[1])[1]))" "$WG_SUBNET")"
+      PREFIX="$${WG_SUBNET#*/}"
+
+      # Torn down and rebuilt from scratch, so a removed peer file is a real
+      # revocation rather than a stale entry left in the running interface.
+      if ip link show wg0 >/dev/null 2>&1; then
+        /bin/bash /etc/vaultwarden/wg-firewall.sh down "$WG_SUBNET" "$WG_PORT" || true
+        ip link del wg0
+      fi
+
+      ip link add dev wg0 type wireguard
+      ip address add "$SERVER_IP/$PREFIX" dev wg0
+
+      # Peer set is written as a wg(8) config fragment holding only [Peer]
+      # stanzas; `wg setconf` applies the interface key, port and peers at once.
+      FRAG="$WG/wg0.conf"
+      umask 077
+      {
+        echo "[Interface]"
+        echo "ListenPort = $WG_PORT"
+        echo "PrivateKey = $(cat "$WG/server_private.key")"
+
+        shopt -s nullglob
+        for peer in "$WG"/peers/*.conf; do
+          name="$(basename "$peer" .conf)"
+          # shellcheck disable=SC1090
+          ( . "$peer"
+            echo
+            echo "# $name"
+            echo "[Peer]"
+            echo "PublicKey = $PEER_PUBLIC"
+            echo "PresharedKey = $PEER_PSK"
+            # /32 so no peer can source-spoof another's tunnel address.
+            echo "AllowedIPs = $PEER_IP/32" )
+        done
+      } > "$FRAG"
+      chmod 0600 "$FRAG"
+
+      wg_run wg setconf wg0 /wg/wg0.conf
+
+      # GCE's NIC is 1460, not the usual 1500, and WireGuard's own header costs
+      # 80 bytes. wg-quick's default of 1420 assumes a 1500-byte path, so on GCP
+      # it produces packets that need fragmenting; the symptom is a tunnel that
+      # handshakes fine and then stalls on anything larger than a ping.
+      ip link set mtu 1380 dev wg0
+      ip link set wg0 up
+
+      /bin/bash /etc/vaultwarden/wg-firewall.sh up "$WG_SUBNET" "$WG_PORT"
+      echo "wg0 up on $SERVER_IP/$PREFIX port $WG_PORT with $(grep -c '^\[Peer\]' "$FRAG" || true) peer(s)."
+
+  # ---------------------------------------------------------------------------
+  # NAT and isolation rules, invoked by wg0.conf's PostUp/PostDown. Called with
+  # `up <subnet>` / `down <subnet>`; `down` mirrors `up` exactly so a restart
+  # leaves no duplicate rules behind.
+  # ---------------------------------------------------------------------------
+  - path: /etc/vaultwarden/wg-firewall.sh
+    permissions: "0755"
+    owner: root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      ACTION="$1"
+      SUBNET="$2"
+      PORT="$${3:-51820}"
+
+      # The default-route interface, not a hardcoded eth0. The instance's public
+      # address is 1:1 NAT upstream and never appears on the NIC, so traffic has
+      # to be masqueraded to whichever interface holds the internal address.
+      IFACE="$(ip -4 route show default | awk '{print $5; exit}')"
+      [ -n "$IFACE" ] || { echo "No default route interface found." >&2; exit 1; }
+
+      case "$ACTION" in
+        up)   nat=-A; fwd=-I ;;
+        down) nat=-D; fwd=-D ;;
+        *)    echo "Usage: wg-firewall.sh {up|down} <subnet>" >&2; exit 64 ;;
+      esac
+
+      # COS ships a default-DROP INPUT chain that permits only established
+      # connections, loopback, ICMP and SSH. Without this rule the handshake
+      # never reaches WireGuard: GCP's firewall allows the packet, the VM's own
+      # firewall then silently drops it, and the client just times out. Docker's
+      # published ports bypass INPUT via its own chains, which is why HTTP and
+      # HTTPS work without an equivalent rule and this omission is easy to miss.
+      iptables $fwd INPUT -p udp --dport "$PORT" -j ACCEPT
+
+      # Traffic originating from the tunnel is addressed to the VM itself.
+      iptables $fwd INPUT -i wg0 -j ACCEPT
+
+      # This is the line that turns the VM into an exit node: rewrite the source
+      # of tunnel traffic to the VM's own address so replies come back here.
+      iptables -t nat $nat POSTROUTING -s "$SUBNET" -o "$IFACE" -j MASQUERADE
+
+      # -I inserts at the head of FORWARD, ahead of the ACCEPT rules Docker
+      # installs for the Vaultwarden containers. Listed here in reverse of the
+      # order they end up in, since each insert pushes the previous one down.
+      iptables $fwd FORWARD -i wg0 -o "$IFACE" -j ACCEPT
+      iptables $fwd FORWARD -i "$IFACE" -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+      # Deny rules, which must sit ABOVE the accepts above once inserted.
+      # 169.254.169.254 is the critical one: reaching the metadata server would
+      # hand a VPN client the VM's service-account token, and with it the
+      # admin-token secret and the backup bucket.
+      for net in 192.168.0.0/16 172.16.0.0/12 10.0.0.0/8 169.254.0.0/16; do
+        iptables $fwd FORWARD -i wg0 -d "$net" -j REJECT
+      done
+
+      # Lands above every REJECT above. The tunnel range lives inside
+      # 10.0.0.0/8; without this exemption the blanket RFC1918 deny would
+      # blackhole the VPN's own traffic between peers and the server.
+      iptables $fwd FORWARD -i wg0 -d "$SUBNET" -j RETURN
+
+      # Inserted last so it sits at the very top, ahead of the RETURN that would
+      # otherwise let peers reach one another. Hub-and-spoke: devices talk to
+      # the internet through this box, never to each other.
+      iptables $fwd FORWARD -i wg0 -o wg0 -j DROP
+
+  # ---------------------------------------------------------------------------
+  # Operator tool for managing VPN devices. Peer private keys are generated here
+  # and shown once; they are stored on the data disk so `show` can reprint a
+  # config, and never leave the VM by any other path.
+  # ---------------------------------------------------------------------------
+  - path: /etc/vaultwarden/wg-peer.sh
+    permissions: "0755"
+    owner: root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      WG="/mnt/disks/data/wireguard"
+      # shellcheck disable=SC1091
+      . "$WG/runtime.env"
+
+      wg_run() { /usr/bin/docker run --rm -i --entrypoint "" ${wireguard_image} "$@"; }
+
+      usage() {
+        echo "Usage: wg-peer.sh {add|show|qr|list|remove} [name]" >&2
+        echo "  qr <name>  writes a scannable PNG to /tmp/<name>-qr.png" >&2
+        exit 64
+      }
+
+      render() {
+        local name="$1"
+        # shellcheck disable=SC1090
+        . "$WG/peers/$name.conf"
+        local prefix="$${WG_SUBNET#*/}"
+        cat <<EOF
+      [Interface]
+      PrivateKey = $PEER_PRIVATE
+      Address = $PEER_IP/$prefix
+      DNS = 1.1.1.1, 1.0.0.1
+
+      [Peer]
+      PublicKey = $(cat "$WG/server_public.key")
+      PresharedKey = $PEER_PSK
+      Endpoint = $WG_ENDPOINT:$WG_PORT
+      AllowedIPs = 0.0.0.0/0, ::/0
+      PersistentKeepalive = 25
+      EOF
+      }
+
+      # A PNG, not a terminal QR: ANSI block output frequently fails to scan and
+      # cannot be copied off the box. Written somewhere the operator can fetch it
+      # with `gcloud compute scp`.
+      write_png() {
+        local name="$1" out="/tmp/$name-qr.png"
+        render "$name" | wg_run qrencode -t png -o - -s 10 -m 2 > "$out"
+        chmod 0644 "$out"
+        echo "QR written to $out on the VM. Fetch it with:"
+        echo "  gcloud compute scp vaultwarden:$out ~/Desktop/$name-qr.png \\"
+        echo "    --project ${project_id} --zone ${zone} --tunnel-through-iap"
+      }
+
+      cmd="$${1:-}"
+      case "$cmd" in
+        add)
+          name="$${2:-}"; [ -n "$name" ] || usage
+          [ -f "$WG/peers/$name.conf" ] && { echo "Peer '$name' already exists." >&2; exit 1; }
+
+          # Lowest free host address above the server's own (.1).
+          used="$(grep -h '^PEER_IP=' "$WG"/peers/*.conf 2>/dev/null | cut -d= -f2 || true)"
+          peer_ip="$(python3 - "$WG_SUBNET" <<'PY' "$used"
+      import ipaddress, sys
+      net = ipaddress.ip_network(sys.argv[1])
+      taken = set(filter(None, sys.argv[2].split())) if len(sys.argv) > 2 else set()
+      for host in list(net.hosts())[1:]:
+          if str(host) not in taken:
+              print(host); break
+      else:
+          sys.exit("No free addresses left in " + str(net))
+      PY
+      )"
+
+          umask 077
+          priv="$(wg_run wg genkey)"
+          pub="$(printf '%s' "$priv" | wg_run wg pubkey)"
+          psk="$(wg_run wg genpsk)"
+
+          cat > "$WG/peers/$name.conf" <<EOF
+      PEER_PRIVATE=$priv
+      PEER_PUBLIC=$pub
+      PEER_PSK=$psk
+      PEER_IP=$peer_ip
+      EOF
+          chmod 0600 "$WG/peers/$name.conf"
+
+          systemctl restart wireguard.service
+          echo "Peer '$name' added as $peer_ip."
+          echo
+          render "$name"
+          echo
+          write_png "$name"
+          ;;
+        show)
+          name="$${2:-}"; [ -n "$name" ] || usage
+          [ -f "$WG/peers/$name.conf" ] || { echo "No such peer: $name" >&2; exit 1; }
+          render "$name"
+          ;;
+        qr)
+          name="$${2:-}"; [ -n "$name" ] || usage
+          [ -f "$WG/peers/$name.conf" ] || { echo "No such peer: $name" >&2; exit 1; }
+          write_png "$name"
+          ;;
+        list)
+          shopt -s nullglob
+          printf '%-16s %s\n' "PEER" "TUNNEL IP"
+          for peer in "$WG"/peers/*.conf; do
+            # shellcheck disable=SC1090
+            ( . "$peer"; printf '%-16s %s\n' "$(basename "$peer" .conf)" "$PEER_IP" )
+          done
+          echo
+          # Needs the host netns to see wg0; there is no long-lived container.
+          /usr/bin/docker run --rm --network host --cap-add NET_ADMIN \
+            --entrypoint "" ${wireguard_image} wg show 2>/dev/null || true
+          ;;
+        remove)
+          name="$${2:-}"; [ -n "$name" ] || usage
+          [ -f "$WG/peers/$name.conf" ] || { echo "No such peer: $name" >&2; exit 1; }
+          rm -f "$WG/peers/$name.conf"
+          systemctl restart wireguard.service
+          echo "Peer '$name' removed; its key no longer appears in wg0.conf."
+          ;;
+        *)
+          usage
+          ;;
+      esac
 
   # ---------------------------------------------------------------------------
   # Backup: SIGUSR1 makes Vaultwarden run `VACUUM INTO`, producing a
@@ -294,6 +617,52 @@ write_files:
       [Install]
       WantedBy=multi-user.target
 
+  # ---------------------------------------------------------------------------
+  # Tears the tunnel down. Mirrors the setup in wg-init.sh so that a restart
+  # leaves no interface and no iptables rules behind.
+  # ---------------------------------------------------------------------------
+  - path: /etc/vaultwarden/wg-down.sh
+    permissions: "0755"
+    owner: root
+    content: |
+      #!/bin/bash
+      set -uo pipefail
+      WG="/mnt/disks/data/wireguard"
+      # shellcheck disable=SC1091
+      [ -f "$WG/runtime.env" ] && . "$WG/runtime.env"
+      /bin/bash /etc/vaultwarden/wg-firewall.sh down "$${WG_SUBNET:-10.8.0.0/24}" "$${WG_PORT:-51820}" 2>/dev/null || true
+      ip link del wg0 2>/dev/null || true
+      exit 0
+
+  # ---------------------------------------------------------------------------
+  # Type=oneshot with RemainAfterExit: the tunnel is kernel state, not a
+  # process, so there is nothing to supervise once wg0 exists.
+  #
+  # Deliberately NOT a long-running `docker run --network host` container. That
+  # arrangement took the VM's entire network down — SSH and Vaultwarden included
+  # — every time the unit started, because the image's s6 init reconfigures the
+  # namespace it is given, which under --network host is the host's own.
+  # ---------------------------------------------------------------------------
+  - path: /etc/systemd/system/wireguard.service
+    permissions: "0644"
+    owner: root
+    content: |
+      [Unit]
+      Description=WireGuard VPN exit node
+      After=network-online.target vaultwarden-disk.service docker.service
+      Requires=vaultwarden-disk.service docker.service
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=true
+      ExecStartPre=/bin/bash /etc/vaultwarden/wg-runtime-config.sh
+      ExecStart=/bin/bash /etc/vaultwarden/wg-init.sh
+      ExecStop=/bin/bash /etc/vaultwarden/wg-down.sh
+
+      [Install]
+      WantedBy=multi-user.target
+
   - path: /etc/systemd/system/vaultwarden-backup.service
     permissions: "0644"
     owner: root
@@ -326,4 +695,5 @@ runcmd:
   - systemctl enable --now vaultwarden-disk.service
   - systemctl enable --now vaultwarden.service
   - systemctl enable --now caddy.service
+  - systemctl enable --now wireguard.service
   - systemctl enable --now vaultwarden-backup.timer

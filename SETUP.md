@@ -121,8 +121,8 @@ acme_email      = "you@example.com"
 
 domain = "PLACEHOLDER"   # filled in at step 5
 
-region = "us-central1"   # must be us-west1 / us-central1 / us-east1
-zone   = "us-central1-a"
+region = "us-west1"   # must be us-west1 / us-central1 / us-east1
+zone   = "us-west1-a"
 
 boot_disk_gb = 20        # boot + data must total <= 30
 data_disk_gb = 10
@@ -257,7 +257,7 @@ strangers. Open it just long enough to create your account.
 sed -i '' 's/signups_allowed = false/signups_allowed = true/' terraform.tfvars
 terraform apply -auto-approve
 
-gcloud compute ssh vaultwarden --project "$PROJECT_ID" --zone us-central1-a \
+gcloud compute ssh vaultwarden --project "$PROJECT_ID" --zone us-west1-a \
   --tunnel-through-iap --command 'sudo systemctl restart vaultwarden'
 ```
 
@@ -285,7 +285,7 @@ Then close registration again — **do not skip this**:
 sed -i '' 's/signups_allowed = true/signups_allowed = false/' terraform.tfvars
 terraform apply -auto-approve
 
-gcloud compute ssh vaultwarden --project "$PROJECT_ID" --zone us-central1-a \
+gcloud compute ssh vaultwarden --project "$PROJECT_ID" --zone us-west1-a \
   --tunnel-through-iap --command 'sudo systemctl restart vaultwarden'
 ```
 
@@ -323,7 +323,7 @@ A nightly timer at 02:30 UTC archives the vault to GCS. Test it now rather than
 discovering a problem when you need a restore:
 
 ```bash
-gcloud compute ssh vaultwarden --project "$PROJECT_ID" --zone us-central1-a \
+gcloud compute ssh vaultwarden --project "$PROJECT_ID" --zone us-west1-a \
   --tunnel-through-iap --command 'sudo systemctl start vaultwarden-backup.service && echo OK'
 
 gcloud storage ls -l "gs://$(terraform output -raw backup_bucket)/"
@@ -393,7 +393,7 @@ terraform output admin_token_command  # read the stored admin hash
 
 ```bash
 terraform apply
-gcloud compute ssh vaultwarden --zone us-central1-a --tunnel-through-iap \
+gcloud compute ssh vaultwarden --zone us-west1-a --tunnel-through-iap \
   --command 'sudo systemctl restart vaultwarden'
 ```
 
@@ -432,7 +432,7 @@ backup first, then rebuild as above.
 
 ```bash
 # Back up first — the data disk is prevent_destroy and will block the destroy.
-gcloud compute ssh vaultwarden --zone us-central1-a --tunnel-through-iap \
+gcloud compute ssh vaultwarden --zone us-west1-a --tunnel-through-iap \
   --command 'sudo systemctl start vaultwarden-backup.service'
 gcloud storage cp "gs://$(terraform output -raw backup_bucket)/*" ./final-backup/
 

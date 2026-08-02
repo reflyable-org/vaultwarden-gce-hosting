@@ -52,7 +52,7 @@ variable "acme_email" {
 variable "region" {
   description = "Region. Must be a free-tier-eligible region for e2-micro."
   type        = string
-  default     = "us-central1"
+  default     = "us-west1"
 
   validation {
     condition     = contains(["us-west1", "us-central1", "us-east1"], var.region)
@@ -63,7 +63,7 @@ variable "region" {
 variable "zone" {
   description = "Zone within the region."
   type        = string
-  default     = "us-central1-a"
+  default     = "us-west1-a"
 }
 
 variable "machine_type" {
@@ -106,6 +106,57 @@ variable "caddy_image" {
   description = "Caddy image used for automatic HTTPS."
   type        = string
   default     = "docker.io/library/caddy:2-alpine"
+}
+
+variable "wireguard_image" {
+  description = <<-EOT
+    WireGuard container image. Runs with --network host so it can own a real wg0
+    in the host network namespace; it does NOT join vaultwarden-net and has no
+    path to the Vaultwarden container. Falls back to userspace boringtun if the
+    kernel module is absent, which matters because Secure Boot is enabled and
+    would block an out-of-tree module build.
+  EOT
+  type        = string
+  default     = "docker.io/linuxserver/wireguard:1.0.20250521"
+}
+
+variable "wireguard_port" {
+  description = "UDP port for the WireGuard listener. The only port this config newly exposes."
+  type        = number
+  default     = 51820
+
+  validation {
+    condition     = var.wireguard_port > 1024 && var.wireguard_port < 65536
+    error_message = "wireguard_port must be an unprivileged port between 1025 and 65535."
+  }
+}
+
+variable "wireguard_subnet" {
+  description = <<-EOT
+    CIDR for the VPN tunnel itself. The server takes the first host address
+    (e.g. 10.8.0.1) and peers are allocated upward from there. Must not overlap
+    the VPC subnet 10.10.0.0/24 — an overlap silently blackholes the tunnel
+    rather than producing an error.
+  EOT
+  type        = string
+  default     = "10.8.0.0/24"
+
+  validation {
+    condition     = can(cidrhost(var.wireguard_subnet, 1))
+    error_message = "wireguard_subnet must be a valid IPv4 CIDR, e.g. 10.8.0.0/24."
+  }
+
+  # Two CIDRs overlap iff their network addresses agree under the shorter of the
+  # two masks. Comparing at that width covers either range containing the other,
+  # regardless of which prefix is longer.
+  validation {
+    condition = (
+      cidrhost("${cidrhost(var.wireguard_subnet, 0)}/${min(tonumber(split("/", var.wireguard_subnet)[1]), 24)}", 0)
+      !=
+      cidrhost("10.10.0.0/${min(tonumber(split("/", var.wireguard_subnet)[1]), 24)}", 0)
+    )
+    error_message = "wireguard_subnet must not overlap the VPC subnet 10.10.0.0/24."
+  }
 }
 
 variable "signups_allowed" {

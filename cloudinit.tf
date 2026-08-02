@@ -10,5 +10,11 @@ locals {
     admin_secret_id   = var.enable_admin_page ? google_secret_manager_secret.admin_token[0].secret_id : ""
     backup_bucket     = google_storage_bucket.backups.name
     backup_schedule   = var.backup_schedule
+
+    zone               = var.zone
+    wireguard_image    = var.wireguard_image
+    wireguard_port     = tostring(var.wireguard_port)
+    wireguard_subnet   = var.wireguard_subnet
+    wireguard_endpoint = google_compute_address.vault.address
   })
 }

@@ -28,6 +28,21 @@ output "admin_token_command" {
   value       = var.enable_admin_page ? "gcloud secrets versions access latest --secret=${google_secret_manager_secret.admin_token[0].secret_id} --project=${var.project_id}" : "admin page disabled"
 }
 
+output "wireguard_endpoint" {
+  description = "Endpoint the WireGuard client config points at."
+  value       = "${google_compute_address.vault.address}:${var.wireguard_port}"
+}
+
+output "wireguard_add_peer_command" {
+  description = "Add a VPN device and print its config plus a scannable QR code."
+  value       = "gcloud compute ssh vaultwarden --project ${var.project_id} --zone ${var.zone} --tunnel-through-iap --command 'sudo /bin/bash /etc/vaultwarden/wg-peer.sh add phone'"
+}
+
+output "wireguard_status_command" {
+  description = "List configured peers and their last handshake times."
+  value       = "gcloud compute ssh vaultwarden --project ${var.project_id} --zone ${var.zone} --tunnel-through-iap --command 'sudo /bin/bash /etc/vaultwarden/wg-peer.sh list'"
+}
+
 output "logs_command" {
   description = "Tail the Vaultwarden container logs."
   value       = "gcloud compute ssh vaultwarden --project ${var.project_id} --zone ${var.zone} --tunnel-through-iap --command 'sudo docker logs -f vaultwarden'"

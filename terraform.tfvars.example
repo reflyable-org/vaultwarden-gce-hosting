@@ -17,8 +17,8 @@ billing_account = "XXXXXX-XXXXXX-XXXXXX"
 
 # --- Free tier ----------------------------------------------------------------
 # Only us-west1 / us-central1 / us-east1 are free for e2-micro.
-region = "us-central1"
-zone   = "us-central1-a"
+region = "us-west1"
+zone   = "us-west1-a"
 
 # boot + data must total <= 30GB.
 boot_disk_gb = 20

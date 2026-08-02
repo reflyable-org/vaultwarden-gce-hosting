@@ -2,7 +2,7 @@ resource "random_id" "bucket_suffix" {
   byte_length = 4
 }
 
-# Backups. A disk is not a backup: this protects against accidental deletion,
+# Backups. This protects against accidental deletion,
 # a corrupted vault, or losing the zone. PD snapshots are NOT free, so archives
 # go to a regional bucket inside the 5GB-month always-free allowance.
 #

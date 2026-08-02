@@ -88,6 +88,26 @@ resource "google_compute_firewall" "allow_health_checks" {
   target_tags   = ["vaultwarden"]
 }
 
+# The only port this configuration newly exposes. WireGuard is silent by design:
+# a packet that does not carry a valid key exchange gets no response at all, so
+# the listener is not discoverable by scanning the way a TCP service is.
+resource "google_compute_firewall" "allow_wireguard" {
+  project     = local.project_id
+  name        = "vaultwarden-allow-wireguard"
+  network     = google_compute_network.vault.name
+  description = "WireGuard VPN listener. UDP only; unauthenticated probes are dropped by WireGuard itself."
+  direction   = "INGRESS"
+  priority    = 1000
+
+  allow {
+    protocol = "udp"
+    ports    = [tostring(var.wireguard_port)]
+  }
+
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["vaultwarden"]
+}
+
 resource "google_compute_firewall" "deny_all_ingress" {
   project     = local.project_id
   name        = "vaultwarden-deny-all-ingress"

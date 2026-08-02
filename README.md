@@ -9,19 +9,24 @@ needed.
 
 ```
 GCP project
-└── us-central1-a
+└── us-west1-a
     └── e2-micro VM  (always-free)
         ├── Container-Optimized OS
         ├── 20GB pd-standard boot disk
         ├── 10GB pd-standard data disk  ── /mnt/disks/data
         │     ├── vaultwarden/  SQLite + rsa_key.pem + attachments
-        │     └── caddy/        TLS certs
+        │     ├── caddy/        TLS certs
+        │     └── wireguard/    VPN server + peer keys
         └── Docker
             ├── vaultwarden/server   :8080  (internal only)
-            └── caddy                :80/:443  automatic HTTPS
+            ├── caddy                :80/:443  automatic HTTPS
+            └── wireguard            :51820/udp  VPN exit node
                     │
                     └── nightly backup → GCS bucket (5GB free tier)
 ```
+
+The same VM doubles as a personal WireGuard VPN, so a phone abroad can browse
+from the VM's US IP. Connecting a phone: **[VPN.md](VPN.md)**.
 
 Deploying from scratch? Start with **[SETUP.md](SETUP.md)**.
 
@@ -97,7 +102,7 @@ The server ships with signups disabled so a public URL can't be used by stranger
 # 1. open registration
 sed -i '' 's/signups_allowed = false/signups_allowed = true/' terraform.tfvars
 terraform apply -auto-approve
-gcloud compute ssh vaultwarden --zone us-central1-a --tunnel-through-iap \
+gcloud compute ssh vaultwarden --zone us-west1-a --tunnel-through-iap \
   --command 'sudo systemctl restart vaultwarden'
 
 # 2. visit https://<your domain> and create your account
@@ -105,7 +110,7 @@ gcloud compute ssh vaultwarden --zone us-central1-a --tunnel-through-iap \
 # 3. close registration again — do not skip
 sed -i '' 's/signups_allowed = true/signups_allowed = false/' terraform.tfvars
 terraform apply -auto-approve
-gcloud compute ssh vaultwarden --zone us-central1-a --tunnel-through-iap \
+gcloud compute ssh vaultwarden --zone us-west1-a --tunnel-through-iap \
   --command 'sudo systemctl restart vaultwarden'
 ```
 
@@ -228,7 +233,7 @@ into `/admin`) in your own password manager; only the hash lives here.
 
 ## Backups
 
-A disk is not a backup. A nightly timer runs `vaultwarden backup`, which performs
+A nightly timer runs `vaultwarden backup`, which performs
 `VACUUM INTO` for a transactionally consistent SQLite copy, then archives it to
 GCS. (The CLI is used rather than the `SIGUSR1` signal because it is synchronous
 and exits non-zero on failure — a fire-and-forget signal makes a failed backup
@@ -261,6 +266,77 @@ To restore: stop Vaultwarden, extract the archive over `/mnt/disks/data/vaultwar
 rename `db.sqlite3` into place, start it, and confirm an existing client logs in
 _without_ being forced to re-authenticate.
 
+## VPN (WireGuard)
+
+The VM also runs a WireGuard server, so a phone anywhere can route its traffic
+out through the VM's US IP. It shares the box with Vaultwarden and adds no cost.
+
+```
+phone ──UDP 51820──> VM (10.8.0.1) ──MASQUERADE──> internet
+                       │
+                       └── traffic exits from the VM's US public IP
+```
+
+| Setting       | Value                                          |
+| ------------- | ---------------------------------------------- |
+| Tunnel subnet | `10.8.0.0/24` — server `.1`, peers from `.2` up |
+| Port          | `51820/udp` (the only newly exposed port)      |
+| Config        | `/mnt/disks/data/wireguard/` on the data disk  |
+| Client DNS    | `1.1.1.1`, `1.0.0.1`                           |
+
+Both are runtime metadata (`wg-port`, `wg-subnet`), so changing them is
+`terraform apply` plus `systemctl restart wireguard` — no rebuild.
+
+### Add a device
+
+```bash
+terraform output wireguard_add_peer_command   # or, on the VM:
+sudo /bin/bash /etc/vaultwarden/wg-peer.sh add phone
+```
+
+Prints the client config and writes a scannable QR **PNG** to `/tmp/<name>-qr.png`
+on the VM (fetch it with `gcloud compute scp`). `AllowedIPs = 0.0.0.0/0, ::/0`
+makes it a full tunnel, and `PersistentKeepalive = 25` keeps it alive through
+mobile CGNAT.
+
+Adding a second device is the same command with a different name; addresses are
+allocated automatically.
+
+```bash
+sudo /bin/bash /etc/vaultwarden/wg-peer.sh list          # peers + last handshake
+sudo /bin/bash /etc/vaultwarden/wg-peer.sh show phone    # reprint config as text
+sudo /bin/bash /etc/vaultwarden/wg-peer.sh qr phone      # write a scannable PNG
+sudo /bin/bash /etc/vaultwarden/wg-peer.sh remove phone  # revoke
+sudo systemctl restart wireguard                         # restart
+sudo ip -brief addr show wg0                             # status
+```
+
+Full walkthrough for getting a phone connected: **[VPN.md](VPN.md)**.
+
+**Revoking** deletes the peer file and restarts, which regenerates `wg0.conf`
+without that key — the device cannot reconnect. To rotate a device's keys,
+`remove` then `add` under the same name and re-scan.
+
+`peers/` is the source of truth: `wg0.conf` is rebuilt from it on every start, so
+a reboot never regenerates keys clients already trust.
+
+### Verify traffic exits the US
+
+With the VPN off, check the phone's IP at `https://ifconfig.me`; turn the VPN on
+and reload. It should change to the address from `terraform output static_ip`.
+Confirm DNS still resolves and that the vault is reachable either way.
+
+### Isolation
+
+Peers get the internet and nothing else. Forwarded traffic to RFC1918 ranges and
+to `169.254.169.254` is rejected, so a phone on the VPN cannot reach the VPC
+subnet or the **GCP metadata server** — the latter matters because it would
+otherwise hand out the VM's service-account token, and with it the admin secret
+and backup bucket. Peers are also isolated from each other.
+
+Private keys are generated on the VM and never appear in Terraform state, in
+metadata, or in this repo.
+
 ## Staying at $0
 
 ### Running cost: **$0.00/month**
@@ -270,12 +346,12 @@ inside.
 
 | Resource       | Provisioned                          | Always-free allowance                 | Headroom      |
 | -------------- | ------------------------------------ | ------------------------------------- | ------------- |
-| VM             | `e2-micro`, `us-central1-a`, standard | 1× `e2-micro` in us-west1/central1/east1 | exact fit     |
+| VM             | `e2-micro`, `us-west1-a`, standard | 1× `e2-micro` in us-west1/central1/east1 | exact fit     |
 | Disks          | `pd-standard` 20GB + 10GB = **30GB** | 30GB `pd-standard`, project-wide total | **at limit**  |
 | Static IP      | attached, `IN_USE`                   | free while attached to a running VM   | fine          |
 | Backup bucket  | regional, a single vault's backups   | 5GB-months regional                   | negligible    |
 | Secret Manager | 1 secret                             | 6 active versions                     | fine          |
-| Egress         | personal client sync                 | 200GB/month North America             | negligible    |
+| Egress         | client sync + VPN browsing           | 200GB/month North America             | **watch this** |
 
 No load balancers, Cloud NAT, PD snapshots, or custom images — the usual silent
 billers are all absent, and PD snapshots are deliberately avoided in favour of
@@ -300,6 +376,10 @@ sslip.io hostname.
 2. **A reserved-but-unattached static IP is billed** (~$0.50/mo) — it is free only
    while attached to a *running* instance. If you `terraform destroy` the VM,
    release the address too.
+3. **VPN egress counts against the 200GB/month allowance.** Vaultwarden sync
+   alone is negligible, but a full-tunnel VPN carries every byte the phone
+   browses. Casual use is nowhere near the limit; video streaming over the VPN
+   could approach it. The $1 budget alert is what catches this.
 
 Verify actual spend in the billing console after ~48 hours of runtime; the
 config being correct is not the same as the invoice being zero. Free-tier terms
@@ -311,6 +391,13 @@ change — treat the table above as what to check, not a guarantee.
   governed by IAM. OS Login on, project-wide SSH keys blocked.
 - Dedicated VPC — avoids the default network's `default-allow-ssh` from `0.0.0.0/0`.
 - Explicit logged catch-all deny at priority 65535.
+- Only `80/443` (TCP) and `51820` (UDP, WireGuard) are open to the internet, at
+  both layers: the GCP firewall and the VM's own default-DROP INPUT chain.
+  WireGuard is silent by design: a packet without a valid key exchange gets no
+  reply, so the listener does not answer scans the way a TCP service does.
+- VPN peers are confined to internet egress — RFC1918 and the metadata server are
+  rejected, and peers cannot reach each other. WireGuard keys are generated on
+  the VM and stay on the data disk.
 - Shielded VM: secure boot, vTPM, integrity monitoring.
 - Admin token in Secret Manager, fetched at boot — never in instance metadata,
   which is readable by anyone with `compute.instances.get`.
@@ -337,6 +424,14 @@ rediscovered on a rebuild.
 | Admin token never validates                           | `$$` was written in `.tfvars`. Those values are literal — escaping stores the doubled characters verbatim.                                                                                                         |
 | `signups_allowed` change had no effect | cloud-init runs only on first boot, so values baked into the unit file went stale. `DOMAIN` and `SIGNUPS_ALLOWED` are now read from instance metadata on every service start — `terraform apply` plus `systemctl restart vaultwarden` applies them without a rebuild. |
 | WebSocket probe returned 404 | Not a defect. `curl` over HTTP/2 strips `Connection: Upgrade`; the same request over HTTP/1.1 returns 401 (auth required), which is correct. Real clients use HTTP/1.1 for WebSockets. |
+| VPN connects, handshakes, but carries no traffic | Two independent causes, both required: `can_ip_forward` must be true or GCP drops packets whose source is not the instance's own, and MASQUERADE must target the **default-route interface**, not the public IP — that address is 1:1 NAT upstream and never appears on the NIC. |
+| VPN peer could not reach the server's own tunnel address | The blanket `-d 10.0.0.0/8 -j REJECT` isolation rule also matched the tunnel subnet, which lives inside `10/8`. Fixed with a `-d <tunnel subnet> -j RETURN` inserted above the RFC1918 denies. |
+| **Whole VM went unreachable** (SSH + Vaultwarden) whenever WireGuard started; needed `gcloud compute instances reset` | WireGuard ran as a long-lived `docker run --network host` container. The image's s6 init reconfigures whatever network namespace it is given — under `--network host` that is the host's. Replaced with the kernel module + host `ip(8)`, borrowing only the `wg` binary from a transient container. |
+| `docker: sysctl "net.ipv4.conf.all.src_valid_mark" not allowed in host network namespace` | Docker rejects `--sysctl` under `--network host`. Setting it on the host instead is *also* wrong on COS: it propagates to `eth0` and kills established SSH/HTTPS. It is only needed for wg-quick's fwmark routing, which this setup does not use. |
+| `PostUp` script "not found" though it exists on the host | wg-quick runs `PostUp` **inside** the container, which has no `/etc/vaultwarden`. Now the firewall script is invoked from the host by `wg-init.sh`, not from `wg0.conf`. |
+| `sudo: unable to execute .../wg: No such file or directory` | The `wg` binary from the image is musl-linked (`/lib/ld-musl-x86_64.so.1`); COS is glibc and has no loader for it. It cannot be copied to the host — it must run inside a container. (`/tmp` on COS is also `noexec`.) |
+| **VPN connected but no handshake and no traffic** (looks like a ~1KB/s connection that never loads anything) | COS ships a **default-DROP INPUT chain** permitting only established connections, loopback, ICMP and SSH. The GCP firewall allowed udp/51820 but the VM's own firewall silently dropped it. Docker's published ports bypass INPUT through its own chains, which is why 80/443 worked without an equivalent rule and the omission was invisible. Fixed with an explicit `-A INPUT -p udp --dport <port> -j ACCEPT`. |
+| Tunnel handshakes, then stalls on anything bigger than a ping | MTU. GCE's NIC is **1460**, not 1500, and WireGuard's header costs 80 bytes, so wg0 must be **1380**. wg-quick's 1420 default assumes a 1500-byte path and produces packets that need fragmenting. |
 
 ## Files
 
@@ -349,5 +444,5 @@ rediscovered on a rebuild.
 | `secrets.tf`            | Admin token                                         |
 | `budget.tf`             | $1 billing alert                                    |
 | `cloudinit.tf`          | Renders `files/cloud-init.yaml`                     |
-| `files/cloud-init.yaml` | Disk mount, systemd units, Caddyfile, backup script |
+| `files/cloud-init.yaml` | Disk mount, systemd units, Caddyfile, backup + WireGuard scripts |
 | `SETUP.md`              | First-time deployment from an empty GCP account     |
