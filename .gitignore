@@ -10,6 +10,10 @@ terraform.tfvars
 *.auto.tfvars
 !terraform.tfvars.example
 
+# Raw admin token (only its Argon2 hash belongs in tfvars). Never commit.
+.admin-token
+*.secret
+
 override.tf
 override.tf.json
 *_override.tf
